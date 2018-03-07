@@ -1,7 +1,14 @@
-FROM        quay.io/prometheus/busybox:latest
-MAINTAINER  Daniel Qian <qsj.daniel@gmail.com>
+FROM golang as build
 
-COPY kafka_exporter /bin/kafka_exporter
+COPY . /build
+WORKDIR /build
 
-EXPOSE     9308
-ENTRYPOINT [ "/bin/kafka_exporter" ]
+RUN go get -d
+RUN go build -o kafka_exporter
+
+FROM gcr.io/distroless/base
+
+COPY --from=build /build/kafka_exporter /bin/kafka_exporter
+
+EXPOSE 9308
+ENTRYPOINT ["/bin/kafka_exporter"]
