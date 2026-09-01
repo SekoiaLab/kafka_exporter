@@ -130,6 +130,7 @@ This image is configurable using different flags
 | offset.show-all                | true           | Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups                                             |
 | concurrent.enable              | false          | If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters         |
 | topic.workers                  | 100            | Number of topic workers                                                                                                                        |
+| partition.workers              | 1              | Number of in-flight offset fetches per topic (1 = upstream serial behaviour)                                                                    |
 | verbosity                      | 0              | Verbosity log level                                                                                                                            |
 
 ### Notes
