@@ -149,6 +149,8 @@ This image is configurable using different flags
 | offset.show-all                | true           | Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups                                             |
 | concurrent.enable              | false          | If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters         |
 | topic.workers                  | 100            | Number of topic workers                                                                                                                        |
+| group.workers                  | 100            | Number of consumer group workers                                                                                                               |
+| partition.workers              | 100            | Number of partition workers                                                                                                                    |
 | verbosity                      | 0              | Verbosity log level                                                                                                                            |
 
 ### Notes
