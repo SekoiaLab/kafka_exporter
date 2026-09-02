@@ -75,6 +75,7 @@ type Exporter struct {
 	offsetShowAll           bool
 	topicWorkers            int
 	partitionWorkers        int
+	groupWorkers            int
 	allowConcurrent         bool
 	sgMutex                 sync.Mutex
 	sgWaitCh                chan struct{}
@@ -114,6 +115,7 @@ type kafkaOpts struct {
 	offsetShowAll            bool
 	topicWorkers             int
 	partitionWorkers         int
+	groupWorkers             int
 	allowConcurrent          bool
 	allowAutoTopicCreation   bool
 	verbosityLogLevel        int
@@ -279,6 +281,7 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 		offsetShowAll:           opts.offsetShowAll,
 		topicWorkers:            opts.topicWorkers,
 		partitionWorkers:        opts.partitionWorkers,
+		groupWorkers:            opts.groupWorkers,
 		allowConcurrent:         opts.allowConcurrent,
 		sgMutex:                 sync.Mutex{},
 		sgWaitCh:                nil,
@@ -588,99 +591,123 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 			klog.Errorf("Cannot get describe groups: %v", err)
 			return
 		}
+		gw := e.groupWorkers
+		if gw < 1 {
+			gw = 1
+		}
+		var gwg sync.WaitGroup
+		gsem := make(chan struct{}, gw)
 		for _, group := range describeGroups.Groups {
 			if group.Err != 0 {
 				klog.Errorf("Cannot describe for the group %s with error code %d", group.GroupId, group.Err)
 				continue
 			}
-			offsetFetchRequest := sarama.OffsetFetchRequest{ConsumerGroup: group.GroupId, Version: e.fetchOffsetVersion()}
-			if e.offsetShowAll {
-				for topic, partitions := range offset {
-					for partition := range partitions {
-						offsetFetchRequest.AddPartition(topic, partition)
+			gwg.Add(1)
+			gsem <- struct{}{}
+			go func(group *sarama.GroupDescription) {
+				defer gwg.Done()
+				defer func() { <-gsem }()
+				offsetFetchRequest := sarama.OffsetFetchRequest{ConsumerGroup: group.GroupId, Version: e.fetchOffsetVersion()}
+				if e.offsetShowAll {
+					// OffsetFetch v2+ treats a null partition array as "all committed offsets
+					// for this group", so leave the request empty instead of enumerating every
+					// topic-partition of the cluster once per group.
+					if !e.consumerGroupFetchAll {
+						for topic, partitions := range offset {
+							for partition := range partitions {
+								offsetFetchRequest.AddPartition(topic, partition)
+							}
+						}
 					}
-				}
-			} else {
-				for _, member := range group.Members {
-					if len(member.MemberAssignment) == 0 {
-						klog.Warningf("MemberAssignment is empty for group member: %v in group: %v", member.MemberId, group.GroupId)
-						continue
-					}
-					assignment, err := member.GetMemberAssignment()
-					if err != nil {
-						klog.Errorf("Cannot get GetMemberAssignment of group member %v : %v", member, err)
-						continue
-					}
-					for topic, partions := range assignment.Topics {
-						for _, partition := range partions {
-							offsetFetchRequest.AddPartition(topic, partition)
+				} else {
+					for _, member := range group.Members {
+						if len(member.MemberAssignment) == 0 {
+							klog.Warningf("MemberAssignment is empty for group member: %v in group: %v", member.MemberId, group.GroupId)
+							continue
+						}
+						assignment, err := member.GetMemberAssignment()
+						if err != nil {
+							klog.Errorf("Cannot get GetMemberAssignment of group member %v : %v", member, err)
+							continue
+						}
+						for topic, partions := range assignment.Topics {
+							for _, partition := range partions {
+								offsetFetchRequest.AddPartition(topic, partition)
+							}
 						}
 					}
 				}
-			}
-			ch <- prometheus.MustNewConstMetric(
-				consumergroupMembers, prometheus.GaugeValue, float64(len(group.Members)), group.GroupId,
-			)
-			offsetFetchResponse, err := broker.FetchOffset(&offsetFetchRequest)
-			if err != nil {
-				klog.Errorf("Cannot get offset of group %s: %v", group.GroupId, err)
-				continue
-			}
-
-			for topic, partitions := range offsetFetchResponse.Blocks {
-				// If the topic is not consumed by that consumer group, skip it
-				topicConsumed := false
-				for _, offsetFetchResponseBlock := range partitions {
-					// Kafka will return -1 if there is no offset associated with a topic-partition under that consumer group
-					if offsetFetchResponseBlock.Offset != -1 {
-						topicConsumed = true
-						break
-					}
-				}
-				if !topicConsumed {
-					continue
+				ch <- prometheus.MustNewConstMetric(
+					consumergroupMembers, prometheus.GaugeValue, float64(len(group.Members)), group.GroupId,
+				)
+				offsetFetchResponse, err := broker.FetchOffset(&offsetFetchRequest)
+				if err != nil {
+					klog.Errorf("Cannot get offset of group %s: %v", group.GroupId, err)
+					return
 				}
 
-				var currentOffsetSum int64
-				var lagSum int64
-				for partition, offsetFetchResponseBlock := range partitions {
-					err := offsetFetchResponseBlock.Err
-					if err != sarama.ErrNoError {
-						klog.Errorf("Error for  partition %d :%v", partition, err.Error())
+				for topic, partitions := range offsetFetchResponse.Blocks {
+					// The broker may report topics we did not collect offsets for (filtered out,
+					// or deleted since the metadata refresh); we cannot compute lag for those.
+					topicOffsets, known := offset[topic]
+					if !known {
 						continue
 					}
-					currentOffset := offsetFetchResponseBlock.Offset
-					currentOffsetSum += currentOffset
-					ch <- prometheus.MustNewConstMetric(
-						consumergroupCurrentOffset, prometheus.GaugeValue, float64(currentOffset), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
-					)
-					e.mu.Lock()
-					if offset, ok := offset[topic][partition]; ok {
-						// If the topic is consumed by that consumer group, but no offset associated with the partition
-						// forcing lag to -1 to be able to alert on that
-						var lag int64
-						if offsetFetchResponseBlock.Offset == -1 {
-							lag = -1
-						} else {
-							lag = offset - offsetFetchResponseBlock.Offset
-							lagSum += lag
+
+					// If the topic is not consumed by that consumer group, skip it
+					topicConsumed := false
+					for _, offsetFetchResponseBlock := range partitions {
+						// Kafka will return -1 if there is no offset associated with a topic-partition under that consumer group
+						if offsetFetchResponseBlock.Offset != -1 {
+							topicConsumed = true
+							break
 						}
+					}
+					if !topicConsumed {
+						continue
+					}
+
+					var currentOffsetSum int64
+					var lagSum int64
+					for partition, offsetFetchResponseBlock := range partitions {
+						err := offsetFetchResponseBlock.Err
+						if err != sarama.ErrNoError {
+							klog.Errorf("Error for  partition %d :%v", partition, err.Error())
+							continue
+						}
+						currentOffset := offsetFetchResponseBlock.Offset
+						currentOffsetSum += currentOffset
 						ch <- prometheus.MustNewConstMetric(
-							consumergroupLag, prometheus.GaugeValue, float64(lag), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
+							consumergroupCurrentOffset, prometheus.GaugeValue, float64(currentOffset), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
 						)
-					} else {
-						klog.Errorf("No offset of topic %s partition %d, cannot get consumer group lag", topic, partition)
+						// offset is read-only here: the topic collection phase completed above.
+						if offset, ok := topicOffsets[partition]; ok {
+							// If the topic is consumed by that consumer group, but no offset associated with the partition
+							// forcing lag to -1 to be able to alert on that
+							var lag int64
+							if offsetFetchResponseBlock.Offset == -1 {
+								lag = -1
+							} else {
+								lag = offset - offsetFetchResponseBlock.Offset
+								lagSum += lag
+							}
+							ch <- prometheus.MustNewConstMetric(
+								consumergroupLag, prometheus.GaugeValue, float64(lag), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
+							)
+						} else {
+							klog.Errorf("No offset of topic %s partition %d, cannot get consumer group lag", topic, partition)
+						}
 					}
-					e.mu.Unlock()
+					ch <- prometheus.MustNewConstMetric(
+						consumergroupCurrentOffsetSum, prometheus.GaugeValue, float64(currentOffsetSum), group.GroupId, topic,
+					)
+					ch <- prometheus.MustNewConstMetric(
+						consumergroupLagSum, prometheus.GaugeValue, float64(lagSum), group.GroupId, topic,
+					)
 				}
-				ch <- prometheus.MustNewConstMetric(
-					consumergroupCurrentOffsetSum, prometheus.GaugeValue, float64(currentOffsetSum), group.GroupId, topic,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					consumergroupLagSum, prometheus.GaugeValue, float64(lagSum), group.GroupId, topic,
-				)
-			}
+			}(group)
 		}
+		gwg.Wait()
 	}
 
 	klog.V(DEBUG).Info("Fetching consumer group metrics")
@@ -795,6 +822,7 @@ func main() {
 	toFlagBoolVar("concurrent.enable", "If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters. Default is false", false, "false", &opts.allowConcurrent)
 	toFlagIntVar("topic.workers", "Number of topic workers", 100, "100", &opts.topicWorkers)
 	toFlagIntVar("partition.workers", "In-flight offset fetches per topic (1 = serial)", 32, "32", &opts.partitionWorkers)
+	toFlagIntVar("group.workers", "In-flight consumer group offset fetches per broker (1 = serial)", 32, "32", &opts.groupWorkers)
 	toFlagBoolVar("kafka.allow-auto-topic-creation", "If true, the broker may auto-create topics that we requested which do not already exist, default is false.", false, "false", &opts.allowAutoTopicCreation)
 	toFlagIntVar("verbosity", "Verbosity log level", 0, "0", &opts.verbosityLogLevel)
 
