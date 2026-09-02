@@ -145,9 +145,10 @@ This image is configurable using different flags
 | refresh.metadata               | 30s            | Metadata refresh interval                                                                                                                      |
 | offset.show-all                | true           | Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups                                             |
 | concurrent.enable              | false          | If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters         |
-| topic.workers                  | 100            | Number of topic workers                                                                                                                        |
-| partition.workers              | 32             | Number of in-flight offset fetches per topic (1 = serial behaviour)                                                                            |
+| topic.workers                  | 100            | Deprecated, no-op: the topic phase no longer performs per-topic I/O                                                                            |
+| partition.workers              | 32             | Deprecated, no-op: partition offsets are fetched in one request per broker                                                                     |
 | group.workers                  | 32             | Number of in-flight consumer group offset fetches per broker (1 = serial behaviour)                                                            |
+| group.describe                 | true           | Issue DescribeGroups to export `kafka_consumergroup_members`. Set to `false` on large clusters if that metric is unused                        |
 | verbosity                      | 0              | Verbosity log level                                                                                                                            |
 
 ### Notes
